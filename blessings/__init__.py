@@ -1,25 +1,35 @@
-from collections import defaultdict
-from contextlib import contextmanager
-import curses
-from curses import tigetstr, tigetnum, setupterm, tparm
-from fcntl import ioctl
+"""
+(c) 2012 Erik Rose
+MIT Licensed
+https://github.com/erikrose/blessings
+"""
+import curses.has_key
+import contextlib
+import platform
+import termios
+import logging
+import struct
+import fcntl
+import sys
+
+
 try:
+    # pylint: disable=W0611
+    #         Unused import IOUnsupportedOperation
     from io import UnsupportedOperation as IOUnsupportedOperation
 except ImportError:
     class IOUnsupportedOperation(Exception):
-        """A dummy exception to take the place of Python 3's ``io.UnsupportedOperation`` in Python 2"""
-import os
-from os import isatty, environ
-from platform import python_version_tuple
-import struct
-import sys
-from termios import TIOCGWINSZ
+        """
+        dummy exception to take of Python 3's ``io.UnsupportedOperation`` in
+        Python 2.
+        """
 
 
 __all__ = ['Terminal']
 
 
-if ('3', '0', '0') <= python_version_tuple() < ('3', '2', '2+'):  # Good till 3.2.10
+if ('3', '0', '0') <= platform.python_version_tuple() < ('3', '2', '2+'):
+    # Good till 3.2.10
     # Python 3.x < 3.2.3 has a bug in which tparm() erroneously takes a string.
     raise ImportError('Blessings needs Python 3.2.3 or greater for Python 3 '
                       'support due to http://bugs.python.org/issue10570.')
@@ -40,12 +50,8 @@ class Terminal(object):
         around with the terminal; it's almost always needed when the terminal
         is and saves sticking lots of extra args on client functions in
         practice.
-      ``is_a_tty``
-        Whether ``stream`` appears to be a terminal. You can examine this value
-        to decide whether to draw progress bars or other frippery.
-
     """
-    def __init__(self, kind=None, stream=None, force_styling=False):
+    def __init__(self, kind=None, stream=None, rows=24, columns=79):
         """Initialize the terminal.
 
         If ``stream`` is not a tty, I will default to returning an empty
@@ -58,51 +64,76 @@ class Terminal(object):
             the value of the ``TERM`` environment variable.
         :arg stream: A file-like object representing the terminal. Defaults to
             the original value of stdout, like ``curses.initscr()`` does.
-        :arg force_styling: Whether to force the emission of capabilities, even
-            if we don't seem to be in a terminal. This comes in handy if users
-            are trying to pipe your output through something like ``less -r``,
-            which supports terminal codes just fine but doesn't appear itself
-            to be a terminal. Just expose a command-line option, and set
-            ``force_styling`` based on it. Terminal initialization sequences
-            will be sent to ``stream`` if it has a file descriptor and to
-            ``sys.__stdout__`` otherwise. (``setupterm()`` demands to send them
-            somewhere, and stdout is probably where the output is ultimately
-            headed. If not, stderr is probably bound to the same terminal.)
-
-            If you want to force styling to not happen, pass
-            ``force_styling=None``.
-
         """
+        self.kind = kind if kind is not None else 'unknown'
         if stream is None:
             stream = sys.__stdout__
-        try:
-            stream_descriptor = (stream.fileno() if hasattr(stream, 'fileno')
-                                                 and callable(stream.fileno)
-                                 else None)
-        except IOUnsupportedOperation:
-            stream_descriptor = None
-
-        self.is_a_tty = stream_descriptor is not None and isatty(stream_descriptor)
-        self._does_styling = ((self.is_a_tty or force_styling) and
-                              force_styling is not None)
-
-        # The desciptor to direct terminal initialization sequences to.
-        # sys.__stdout__ seems to always have a descriptor of 1, even if output
-        # is redirected.
-        self._init_descriptor = (sys.__stdout__.fileno()
-                                 if stream_descriptor is None
-                                 else stream_descriptor)
-        if self._does_styling:
-            # Make things like tigetstr() work. Explicit args make setupterm()
-            # work even when -s is passed to nosetests. Lean toward sending
-            # init sequences to the stream if it has a file descriptor, and
-            # send them to stdout as a fallback, since they have to go
-            # somewhere.
-            setupterm(kind or environ.get('TERM', 'unknown'),
-                      self._init_descriptor)
-
         self.stream = stream
+        self.rows = rows
+        self.columns = columns
+        curses.setupterm(kind, 0)
 
+        # curses capability names are inherited (for comparison)
+        for attr in (a for a in dir(curses) if a.startswith('KEY_')):
+            setattr(self, attr, getattr(curses, attr))
+
+        # pylint: disable=W0212,E1101
+        # Access to a protected member _capability_names of a client class
+        # Function 'has_key' has no '_capability_names' member
+        capabilities = curses.has_key._capability_names.iteritems()
+        self._keymap = dict([(curses.tigetstr(cap).decode('utf8'), keycode)
+                             for (keycode, cap) in capabilities
+                             if curses.tigetstr(cap) is not None])
+
+        # not complete, but pretty close ..
+        self._keymap.update([(sequence, key) for (sequence, key) in (
+            (curses.tigetstr('khome'), self.KEY_HOME),
+            (curses.tigetstr('kend'), self.KEY_END),
+            (curses.tigetstr('kcuu1'), self.KEY_UP),
+            (curses.tigetstr('kcud1'), self.KEY_DOWN),
+            (curses.tigetstr('cuf1'), self.KEY_RIGHT),
+            (curses.tigetstr('kcub1'), self.KEY_LEFT),
+            (curses.tigetstr('knp'), self.KEY_NPAGE),
+            (curses.tigetstr('kind'), self.KEY_NPAGE),
+            (curses.tigetstr('kpp'), self.KEY_PPAGE),
+            (curses.tigetstr('kri'), self.KEY_PPAGE),
+            (curses.tigetstr('kent'), self.KEY_ENTER),
+            (curses.tigetstr('kbs'), self.KEY_BACKSPACE),
+            (curses.tigetstr('kdch1'), self.KEY_BACKSPACE),
+            (curses.tigetstr('kich1'), self.KEY_INSERT),
+            )
+            if sequence is not None and 0 != len(sequence)])
+
+        # add to this various NVT sequences
+        self._keymap.update([
+            (unichr(10), self.KEY_ENTER),
+            (unichr(13), self.KEY_ENTER),
+            (unichr(8), self.KEY_BACKSPACE),
+            (unichr(127), self.KEY_BACKSPACE),
+            (unichr(27) + u"OA", self.KEY_UP),
+            (unichr(27) + u"OB", self.KEY_DOWN),
+            (unichr(27) + u"OC", self.KEY_RIGHT),
+            (unichr(27) + u"OD", self.KEY_LEFT),
+            (unichr(27) + u"OH", self.KEY_LEFT),
+            (unichr(27) + u"OF", self.KEY_END),
+            (unichr(27) + u"[A", self.KEY_UP),
+            (unichr(27) + u"[B", self.KEY_DOWN),
+            (unichr(27) + u"[C", self.KEY_RIGHT),
+            (unichr(27) + u"[D", self.KEY_LEFT),
+            (unichr(27) + u"[H", self.KEY_HOME),
+            (unichr(27) + u"[F", self.KEY_END),
+            (unichr(27) + u"[K", self.KEY_END),
+            (unichr(27) + u"[U", self.KEY_NPAGE),
+            (unichr(27) + u"[V", self.KEY_PPAGE),
+            (unichr(27) + u"[@", self.KEY_INSERT),
+            (unichr(27) + u"A", self.KEY_UP),
+            (unichr(27) + u"B", self.KEY_DOWN),
+            (unichr(27) + u"C", self.KEY_RIGHT),
+            (unichr(27) + u"D", self.KEY_LEFT),
+            (unichr(27) + u"?x", self.KEY_UP),
+            (unichr(27) + u"?r", self.KEY_DOWN),
+            (unichr(27) + u"?v", self.KEY_RIGHT),
+            (unichr(27) + u"?t", self.KEY_LEFT), ])
     # Sugary names for commonly-used capabilities, intended to help avoid trips
     # to the terminfo man page and comments in your code:
     _sugar = dict(
@@ -168,22 +199,24 @@ class Terminal(object):
         Return values are always Unicode.
 
         """
-        resolution = self._resolve_formatter(attr) if self._does_styling else NullCallableString()
-        setattr(self, attr, resolution)  # Cache capability codes.
+        # Cache capability codes.
+        resolution = self._resolve_formatter(attr)
+        setattr(self, attr, resolution)
         return resolution
+
+    def keyname(self, keycode):
+        """
+        Return any matching keycode name for a given keycode.
+        """
+        for key in (attr for attr in dir(self)
+                    if attr.startswith('KEY_')
+                    and keycode == getattr(self, attr)):
+            return key
+        return str(None)
 
     @property
     def height(self):
         """The height of the terminal in characters
-
-        If no stream or a stream not representing a terminal was passed in at
-        construction, return the dimension of the controlling terminal so
-        piping to things that eventually display on the terminal (like ``less
-        -R``) work. If a stream representing a terminal was passed in, return
-        the dimensions of that terminal. If there somehow is no controlling
-        terminal, return ``None``. (Thus, you should check that ``is_a_tty`` is
-        true before doing any math on the result.)
-
         """
         return self._height_and_width()[0]
 
@@ -198,17 +231,17 @@ class Terminal(object):
 
     def _height_and_width(self):
         """Return a tuple of (terminal height, terminal width)."""
-        # tigetnum('lines') and tigetnum('cols') update only if we call
-        # setupterm() again.
-        for descriptor in self._init_descriptor, sys.__stdout__:
+        if self.stream == sys.__stdout__:
             try:
-                return struct.unpack('hhhh', ioctl(descriptor, TIOCGWINSZ, '\000' * 8))[0:2]
+                return struct.unpack(
+                    'hhhh', fcntl.ioctl(sys.__stdout__, termios.TIOCGWINSZ,
+                                        chr(0) * 8))[0:2]
             except IOError:
                 pass
-        return None, None  # Should never get here
+        return (self.rows, self.columns)
 
-    @contextmanager
-    def location(self, x=None, y=None):
+    @contextlib.contextmanager
+    def location(self, xloc=None, yloc=None):
         """Return a context manager for temporarily moving the cursor.
 
         Move the cursor to a certain position on entry, let you print stuff
@@ -228,31 +261,37 @@ class Terminal(object):
 
         """
         # Save position and move to the requested column, row, or both:
-        self.stream.write(self.save)
-        if x is not None and y is not None:
-            self.stream.write(self.move(y, x))
-        elif x is not None:
-            self.stream.write(self.move_x(x))
-        elif y is not None:
-            self.stream.write(self.move_y(y))
+        self.stream.write(self.save, 'iso8859-1')
+        if xloc is not None and yloc is not None:
+            self.stream.write(self.move(yloc, xloc), 'iso8859-1')
+        elif xloc is not None:
+            self.stream.write(self.move_x(xloc), 'iso8859-1')
+        elif yloc is not None:
+            self.stream.write(self.move_y(yloc), 'iso8859-1')
         yield
 
         # Restore original cursor position:
-        self.stream.write(self.restore)
+        self.stream.write(self.restore, 'iso8859-1')
 
-    @contextmanager
+    @contextlib.contextmanager
     def fullscreen(self):
-        """Return a context manager that enters fullscreen mode while inside it and restores normal mode on leaving."""
-        self.stream.write(self.enter_fullscreen)
+        """
+        Return a context manager that enters fullscreen mode while inside it
+        and restores normal mode on leaving.
+        """
+        self.stream.write(self.enter_fullscreen, 'iso8859-1')
         yield
-        self.stream.write(self.exit_fullscreen)
+        self.stream.write(self.exit_fullscreen, 'iso8859-1')
 
-    @contextmanager
+    @contextlib.contextmanager
     def hidden_cursor(self):
-        """Return a context manager that hides the cursor while inside it and makes it visible on leaving."""
-        self.stream.write(self.hide_cursor)
+        """
+        Return a context manager that hides the cursor while inside it and
+        makes it visible on leaving.
+        """
+        self.stream.write(self.hide_cursor, 'iso8859-1')
         yield
-        self.stream.write(self.normal_cursor)
+        self.stream.write(self.normal_cursor, 'iso8859-1')
 
     @property
     def color(self):
@@ -291,18 +330,22 @@ class Terminal(object):
 
         We also return 0 if the terminal won't tell us how many colors it
         supports, which I think is rare.
-
         """
+        # pylint: disable=R0201
+        #        Method could be a function
         # This is actually the only remotely useful numeric capability. We
         # don't name it after the underlying capability, because we deviate
         # slightly from its behavior, and we might someday wish to give direct
         # access to it.
-        colors = tigetnum('colors')  # Returns -1 if no color support, -2 if no such cap.
-        #self.__dict__['colors'] = ret  # Cache it. It's not changing. (Doesn't work.)
+        colors = curses.tigetnum('colors')
+        # Returns -1 if no color support, -2 if no such cap.
         return colors if colors >= 0 else 0
 
     def _resolve_formatter(self, attr):
-        """Resolve a sugary or plain capability name, color, or compound formatting function name into a callable capability."""
+        """
+        Resolve a sugary or plain capability name, color, or compound
+        formatting function name into a callable capability.
+        """
         if attr in COLORS:
             return self._resolve_color(attr)
         elif attr in COMPOUNDABLES:
@@ -320,26 +363,73 @@ class Terminal(object):
                 return ParametrizingString(self._resolve_capability(attr))
 
     def _resolve_capability(self, atom):
-        """Return a terminal code for a capname or a sugary name, or an empty Unicode.
+        """
+        Return a terminal code for a capname or a sugary name, or an empty
+        Unicode.
 
         The return value is always Unicode, because otherwise it is clumsy
         (especially in Python 3) to concatenate with real (Unicode) strings.
 
         """
-        code = tigetstr(self._sugar.get(atom, atom))
+        code = curses.tigetstr(self._sugar.get(atom, atom))
         if code:
             # We can encode escape sequences as UTF-8 because they never
             # contain chars > 127, and UTF-8 never changes anything within that
             # range..
-            return code.decode('utf-8')
+            return code.decode('utf8')
         return u''
 
+    def trans_input(self, text, decoder):
+        """
+        Yield either a unicode byte or a curses key constant as integer.
+        If data is a bytestring, it is converted to unicode using incremental
+        decoder, a result from codecs.getincrementaldecoder(encoding).
+        """
+        logger = logging.getLogger()
+        decoded = list()
+        for byte in text:
+            final = False
+            try:
+                ucs = decoder.decode(byte, final)
+            except UnicodeDecodeError as err:
+                logger.warn(err)
+                ucs = None
+            if ucs is not None:
+                decoded.append(ucs)
+        data = u''.join(decoded)
+
+        def scan_keymap(text):
+            """
+            Return sequence and keycode if text begins with any known sequence.
+            """
+            for (keyseq, keycode) in self._keymap.iteritems():
+                if text.startswith(keyseq):
+                    return (keyseq, keycode)
+            return (None, None)  # no match
+
+        while len(data):
+            if data[:2] in (u'\r\x00', u'\r\n'):
+                # skip beyond nul (nvt telnet), or \n (putty, SyncTerm)
+                yield self.KEY_ENTER
+                data = data[2:]
+                continue
+            elif data[:1] in (u'\r', u'\n'):
+                yield self.KEY_ENTER
+                data = data[1:]
+                continue
+            keyseq, keycode = scan_keymap(data)
+            # keymap KEY_ sequence
+            if (keyseq, keycode) != (None, None):
+                yield keycode
+                data = data[len(keyseq):]
+            else:
+                yield data[0]
+                data = data[1:]
+
     def _resolve_color(self, color):
-        """Resolve a color like red or on_bright_green into a callable capability."""
-        # TODO: Does curses automatically exchange red and blue and cyan and
-        # yellow when a terminal supports setf/setb rather than setaf/setab?
-        # I'll be blasted if I can find any documentation. The following
-        # assumes it does.
+        """
+        Resolve a color like red or on_bright_green into a callable capability.
+        """
         color_cap = (self._background_color if 'on_' in color else
                      self._foreground_color)
         # curses constants go up to only 7, so add an offset to get at the
@@ -351,14 +441,19 @@ class Terminal(object):
 
     @property
     def _foreground_color(self):
+        """ Return ANSI or non-ANSI foreground attribute."""
         return self.setaf or self.setf
 
     @property
     def _background_color(self):
+        """ Return ANSI or non-ANSI background attribute."""
         return self.setab or self.setb
 
     def _formatting_string(self, formatting):
-        """Return a new ``FormattingString`` which implicitly receives my notion of "normal"."""
+        """
+        Return a new ``FormattingString`` which implicitly receives my notion
+        of "normal".
+        """
         return FormattingString(formatting, self.normal)
 
 
@@ -369,7 +464,8 @@ def derivative_colors(colors):
                [('on_bright_' + c) for c in colors])
 
 
-COLORS = set(['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white'])
+COLORS = set(['black', 'red', 'green', 'yellow', 'blue',
+              'magenta', 'cyan', 'white'])
 COLORS.update(derivative_colors(COLORS))
 COMPOUNDABLES = (COLORS |
                  set(['bold', 'underline', 'reverse', 'blink', 'dim', 'italic',
@@ -377,7 +473,14 @@ COMPOUNDABLES = (COLORS |
 
 
 class ParametrizingString(unicode):
-    """A Unicode string which can be called to parametrize it as a terminal capability"""
+    """
+    A Unicode string which can be called to parametrize it as a terminal
+    capability.
+    """
+    # pylint: disable=R0904,R0924
+    #        Too many public methods (40/20)
+    #        Badly implemented Container, implements __getitem__, __len__
+    #          but not __delitem__, __setitem__
     def __new__(cls, formatting, normal=None):
         """Instantiate.
 
@@ -386,6 +489,8 @@ class ParametrizingString(unicode):
             "normal" capability.
 
         """
+        # pylint: disable=W0212
+        #        Access to a protected member _normal of a client class
         new = unicode.__new__(cls, formatting)
         new._normal = normal
         return new
@@ -395,7 +500,8 @@ class ParametrizingString(unicode):
             # Re-encode the cap, because tparm() takes a bytestring in Python
             # 3. However, appear to be a plain Unicode string otherwise so
             # concats work.
-            parametrized = tparm(self.encode('utf-8'), *args).decode('utf-8')
+            lookup = self.encode('utf8')
+            parametrized = curses.tparm(lookup, *args).decode('utf8')
             return (parametrized if self._normal is None else
                     FormattingString(parametrized, self._normal))
         except curses.error:
@@ -419,8 +525,18 @@ class ParametrizingString(unicode):
 
 
 class FormattingString(unicode):
-    """A Unicode string which can be called upon a piece of text to wrap it in formatting"""
+    """
+    A Unicode string which can be called upon a piece of text to wrap it in
+    formatting.
+    """
+    # pylint: disable=R0904,R0924
+    #        Too many public methods (40/20)
+    #        Badly implemented Container, implements __getitem__, __len__
+    #          but not __delitem__, __setitem__
+
     def __new__(cls, formatting, normal):
+        # pylint: disable=W0212
+        #        Access to a protected member _normal of a client class
         new = unicode.__new__(cls, formatting)
         new._normal = normal
         return new
@@ -437,13 +553,20 @@ class FormattingString(unicode):
 
 
 class NullCallableString(unicode):
-    """A dummy class to stand in for ``FormattingString`` and ``ParametrizingString``
+    """
+    A dummy class to stand in for ``FormattingString`` and
+    ``ParametrizingString``.
 
     A callable bytestring that returns an empty Unicode when called with an int
     and the arg otherwise. We use this when there is no tty and so all
     capabilities are blank.
 
     """
+    # pylint: disable=R0904,R0924
+    #        Too many public methods (40/20)
+    #        Badly implemented Container, implements __getitem__, __len__
+    #          but not __delitem__, __setitem__
+
     def __new__(cls):
         new = unicode.__new__(cls, u'')
         return new
@@ -451,7 +574,7 @@ class NullCallableString(unicode):
     def __call__(self, arg):
         if isinstance(arg, int):
             return u''
-        return arg  # TODO: Force even strs in Python 2.x to be unicodes? Nah. How would I know what encoding to use to convert it?
+        return arg
 
 
 def split_into_formatters(compound):
@@ -464,9 +587,9 @@ def split_into_formatters(compound):
     merged_segs = []
     # These occur only as prefixes, so they can always be merged:
     mergeable_prefixes = ['on', 'bright', 'on_bright']
-    for s in compound.split('_'):
+    for spx in compound.split('_'):
         if merged_segs and merged_segs[-1] in mergeable_prefixes:
-            merged_segs[-1] += '_' + s
+            merged_segs[-1] += '_' + spx
         else:
-            merged_segs.append(s)
+            merged_segs.append(spx)
     return merged_segs
